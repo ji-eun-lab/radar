@@ -2,7 +2,6 @@
 Author: Benny
 Date: Nov 2019
 """
-from data_utils.ModelNetDataLoader import ModelNetDataLoader
 import argparse
 import numpy as np
 import os
@@ -11,6 +10,9 @@ import logging
 from tqdm import tqdm
 import sys
 import importlib
+
+from data_utils.h5_loader import H5PointCloudDataset
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
@@ -23,7 +25,7 @@ def parse_args():
     parser.add_argument('--use_cpu', action='store_true', default=False, help='use cpu mode')
     parser.add_argument('--gpu', type=str, default='0', help='specify gpu device')
     parser.add_argument('--batch_size', type=int, default=24, help='batch size in training')
-    parser.add_argument('--num_category', default=40, type=int, choices=[10, 40],  help='training on ModelNet10/40')
+    parser.add_argument('--num_category', default=3, type=int, choices=[3, 10, 40],  help='training on ModelNet10/40')
     parser.add_argument('--num_point', type=int, default=1024, help='Point Number')
     parser.add_argument('--log_dir', type=str, required=True, help='Experiment root')
     parser.add_argument('--use_normals', action='store_true', default=False, help='use normals')
@@ -31,18 +33,20 @@ def parse_args():
     parser.add_argument('--num_votes', type=int, default=3, help='Aggregate classification scores with voting')
     return parser.parse_args()
 
-
-def test(model, loader, num_class=40, vote_num=1):
+def test(model, loader, num_class=3, vote_num=1):
     mean_correct = []
     classifier = model.eval()
     class_acc = np.zeros((num_class, 3))
 
-    for j, (points, target) in tqdm(enumerate(loader), total=len(loader)):
+    # loader.batch_size 가 DataLoader에 설정된 배치 크기입니다.
+    batch_size = loader.batch_size if hasattr(loader, 'batch_size') else args.batch_size
+
+    for batch_idx, (points, target) in tqdm(enumerate(loader), total=len(loader)):
         if not args.use_cpu:
             points, target = points.cuda(), target.cuda()
 
         points = points.transpose(2, 1)
-        vote_pool = torch.zeros(target.size()[0], num_class).cuda()
+        vote_pool = torch.zeros(target.size(0), num_class).cuda()
 
         for _ in range(vote_num):
             pred, _ = classifier(points)
@@ -50,17 +54,29 @@ def test(model, loader, num_class=40, vote_num=1):
         pred = vote_pool / vote_num
         pred_choice = pred.data.max(1)[1]
 
+        # — 여기에 프레임별 출력 추가 —
+        for i in range(target.size(0)):
+            # 전역 프레임 인덱스 계산 (0부터 시작)
+            global_frame_idx = batch_idx * batch_size + i
+            gt = target[i].item()
+            pr = pred_choice[i].item()
+            print(f"[Frame {global_frame_idx}]  GT={gt}  Pred={pr}")
+
+        # 기존 accuracy 계산 로직
         for cat in np.unique(target.cpu()):
-            classacc = pred_choice[target == cat].eq(target[target == cat].long().data).cpu().sum()
-            class_acc[cat, 0] += classacc.item() / float(points[target == cat].size()[0])
+            classacc = pred_choice[target == cat]\
+                       .eq(target[target == cat].long().data)\
+                       .cpu().sum()
+            class_acc[cat, 0] += classacc.item() / float(points[target == cat].size(0))
             class_acc[cat, 1] += 1
         correct = pred_choice.eq(target.long().data).cpu().sum()
-        mean_correct.append(correct.item() / float(points.size()[0]))
+        mean_correct.append(correct.item() / float(points.size(0)))
 
     class_acc[:, 2] = class_acc[:, 0] / class_acc[:, 1]
     class_acc = np.mean(class_acc[:, 2])
     instance_acc = np.mean(mean_correct)
     return instance_acc, class_acc
+
 
 
 def main(args):
@@ -75,7 +91,7 @@ def main(args):
     experiment_dir = 'log/classification/' + args.log_dir
 
     '''LOG'''
-    args = parse_args()
+    # args = parse_args()
     logger = logging.getLogger("Model")
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -88,9 +104,8 @@ def main(args):
 
     '''DATA LOADING'''
     log_string('Load dataset ...')
-    data_path = 'data/modelnet40_normal_resampled/'
 
-    test_dataset = ModelNetDataLoader(root=data_path, args=args, split='test', process_data=False)
+    test_dataset = H5PointCloudDataset(h5_path='data/auto_labeled_patient_dataset.h5', split='test', num_points=args.num_point)
     testDataLoader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=10)
 
     '''MODEL LOADING'''

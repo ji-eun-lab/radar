@@ -17,7 +17,8 @@ import argparse
 
 from pathlib import Path
 from tqdm import tqdm
-from data_utils.ModelNetDataLoader import ModelNetDataLoader
+from data_utils.h5_loader import H5PointCloudSequenceDataset
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
@@ -30,7 +31,7 @@ def parse_args():
     parser.add_argument('--gpu', type=str, default='0', help='specify gpu device')
     parser.add_argument('--batch_size', type=int, default=24, help='batch size in training')
     parser.add_argument('--model', default='pointnet_cls', help='model name [default: pointnet_cls]')
-    parser.add_argument('--num_category', default=40, type=int, choices=[10, 40],  help='training on ModelNet10/40')
+    parser.add_argument('--num_category', default=3, type=int, choices=[10, 40],  help='training on ModelNet10/40')
     parser.add_argument('--epoch', default=200, type=int, help='number of epoch in training')
     parser.add_argument('--learning_rate', default=0.001, type=float, help='learning rate in training')
     parser.add_argument('--num_point', type=int, default=1024, help='Point Number')
@@ -52,30 +53,29 @@ def inplace_relu(m):
 def test(model, loader, num_class=40):
     mean_correct = []
     class_acc = np.zeros((num_class, 3))
-    classifier = model.eval()
+    model.eval()
 
-    for j, (points, target) in tqdm(enumerate(loader), total=len(loader)):
-
+    for points, target in loader:
         if not args.use_cpu:
             points, target = points.cuda(), target.cuda()
 
-        points = points.transpose(2, 1)
-        pred, _ = classifier(points)
+        # 시퀀스 그대로 (B, seq_len, C, N)
+        pred, _ = model(points)
         pred_choice = pred.data.max(1)[1]
 
         for cat in np.unique(target.cpu()):
-            classacc = pred_choice[target == cat].eq(target[target == cat].long().data).cpu().sum()
-            class_acc[cat, 0] += classacc.item() / float(points[target == cat].size()[0])
-            class_acc[cat, 1] += 1
+            classacc = pred_choice[target==cat]\
+                       .eq(target[target==cat].long().data)\
+                       .cpu().sum()
+            class_acc[cat,0] += classacc.item() / float((target==cat).sum())
+            class_acc[cat,1] += 1
 
         correct = pred_choice.eq(target.long().data).cpu().sum()
-        mean_correct.append(correct.item() / float(points.size()[0]))
+        mean_correct.append(correct.item() / float(points.size(0)))
 
-    class_acc[:, 2] = class_acc[:, 0] / class_acc[:, 1]
-    class_acc = np.mean(class_acc[:, 2])
-    instance_acc = np.mean(mean_correct)
+    class_acc[:,2] = class_acc[:,0] / class_acc[:,1]
+    return np.mean(mean_correct), np.mean(class_acc[:,2])
 
-    return instance_acc, class_acc
 
 
 def main(args):
@@ -116,12 +116,36 @@ def main(args):
 
     '''DATA LOADING'''
     log_string('Load dataset ...')
-    data_path = 'data/modelnet40_normal_resampled/'
+    data_path = 'data/auto_labeled_patient_dataset.h5'
 
-    train_dataset = ModelNetDataLoader(root=data_path, args=args, split='train', process_data=args.process_data)
-    test_dataset = ModelNetDataLoader(root=data_path, args=args, split='test', process_data=args.process_data)
-    trainDataLoader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=10, drop_last=True)
-    testDataLoader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=10)
+    # # 변경된 데이터셋 사용
+    # train_dataset = H5PointCloudSequenceDataset(h5_path=data_path, split='train', num_points=args.num_point)
+    # test_dataset = H5PointCloudSequenceDataset(h5_path=data_path, split='test', num_points=args.num_point)
+    
+    
+    # 데이터 로딩부 수정
+    train_dataset = H5PointCloudSequenceDataset(
+        h5_path   = data_path,
+        split     = 'train',
+        num_points= args.num_point,
+        seq_len   = 5
+    )
+    test_dataset = H5PointCloudSequenceDataset(
+        h5_path   = data_path,
+        split     = 'test',
+        num_points= args.num_point,
+        seq_len   = 5
+    )
+
+
+
+
+
+
+
+
+    trainDataLoader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    testDataLoader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     '''MODEL LOADING'''
     num_class = args.num_category
@@ -130,7 +154,9 @@ def main(args):
     shutil.copy('models/pointnet2_utils.py', str(exp_dir))
     shutil.copy('./train_classification.py', str(exp_dir))
 
-    classifier = model.get_model(num_class, normal_channel=args.use_normals)
+    # classifier = model.get_model(num_class, normal_channel=args.use_normals)
+    classifier = model.PointNetLSTM(num_class, normal_channel=args.use_normals)
+
     criterion = model.get_loss()
     classifier.apply(inplace_relu)
 
@@ -175,25 +201,41 @@ def main(args):
         for batch_id, (points, target) in tqdm(enumerate(trainDataLoader, 0), total=len(trainDataLoader), smoothing=0.9):
             optimizer.zero_grad()
 
-            points = points.data.numpy()
-            points = provider.random_point_dropout(points)
-            points[:, :, 0:3] = provider.random_scale_point_cloud(points[:, :, 0:3])
-            points[:, :, 0:3] = provider.shift_point_cloud(points[:, :, 0:3])
-            points = torch.Tensor(points)
-            points = points.transpose(2, 1)
+            # points: (B, seq_len, C, N)
+            points_np = points.numpy()
+
+            # 시퀀스의 각 타임스텝에 대해 dropout, scale, shift 적용
+            for t in range(points_np.shape[1]):
+                # frame: (B, C, N) -> (B, N, C) 로 바꿔서 provider 함수에 넣기
+                frame = points_np[:, t, :, :]
+                frame = np.transpose(frame, (0, 2, 1))  # (B, N, C)
+
+                frame = provider.random_point_dropout(frame)
+                frame[:, :, 0:3] = provider.random_scale_point_cloud(frame[:, :, 0:3])
+                frame[:, :, 0:3] = provider.shift_point_cloud(frame[:, :, 0:3])
+
+                # 다시 (B, C, N) 형태로 복원
+                frame = np.transpose(frame, (0, 2, 1))
+                points_np[:, t, :, :] = frame
+
+            # 텐서로 복원
+            points = torch.tensor(points_np, dtype=torch.float32)
 
             if not args.use_cpu:
                 points, target = points.cuda(), target.cuda()
 
-            pred, trans_feat = classifier(points)
-            loss = criterion(pred, target.long(), trans_feat)
-            pred_choice = pred.data.max(1)[1]
+            # forward
+            pred, _ = classifier(points)
+            loss = criterion(pred, target.long())
 
-            correct = pred_choice.eq(target.long().data).cpu().sum()
-            mean_correct.append(correct.item() / float(points.size()[0]))
             loss.backward()
             optimizer.step()
             global_step += 1
+            
+            pred_choice = pred.data.max(1)[1]                      # (B,) 예측 라벨
+            correct     = pred_choice.eq(target.long()).cpu().sum().item()
+            batch_acc   = correct / float(target.size(0))
+            mean_correct.append(batch_acc)
 
         train_instance_acc = np.mean(mean_correct)
         log_string('Train Instance Accuracy: %f' % train_instance_acc)
